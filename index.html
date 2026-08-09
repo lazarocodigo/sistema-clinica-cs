@@ -362,6 +362,10 @@ let currentUser = null;
 let currentPerfil = null;
 let syncTimer = null;
 let syncEmAndamento = false;
+// Última "foto" do DB que já foi confirmada como sincronizada — serve de base de comparação pro
+// registro de alterações (log de atividade): a cada sync a gente compara o DB atual contra essa
+// foto pra descobrir exatamente o que mudou desde a última vez.
+let DB_ULTIMO_SYNC = null;
 
 function agendarSyncNuvem(){
   if(!sb || !currentUser) return;
@@ -373,14 +377,82 @@ async function enviarParaNuvem(){
   if(!sb || !currentUser || syncEmAndamento) return;
   syncEmAndamento = true;
   try{
+    const entradasLog = DB_ULTIMO_SYNC ? diffParaLog(DB_ULTIMO_SYNC, DB) : [];
     const { error } = await sb.from('dados_app').upsert({ id:'principal', dados: DB, atualizado_por: currentUser.id });
     if(error) throw error;
     setSyncStatus('ok');
+    DB_ULTIMO_SYNC = JSON.parse(JSON.stringify(DB));
+    if(entradasLog.length) registrarAtividade(entradasLog);
   }catch(e){
     console.warn('Falha ao sincronizar com a nuvem:', e);
     setSyncStatus('erro');
   }
   syncEmAndamento = false;
+}
+// ---- Registro de alterações (log de atividade) ----
+// Compara o DB antes/depois pra descobrir o que mudou desde a última sincronização — não precisa
+// instrumentar cada tela/função individualmente, é um único ponto central (aqui e no realtime).
+const LOG_ARRAYS = [
+  {key:'pacientes', label:'Paciente', nomeField:'Nome Completo'},
+  {key:'protocolos', label:'Protocolo', nomeField:'Nome Paciente'},
+  {key:'interacoesMedica', label:'Interação Médica', nomeField:'Nome Paciente'},
+  {key:'interacoesEnfermagem', label:'Interação Enfermagem', nomeField:'Nome Paciente'},
+  {key:'interacoesNutricao', label:'Interação Nutrição', nomeField:'Nome Paciente'},
+  {key:'interacoesCS', label:'Interação CS', nomeField:'Nome Paciente'},
+  {key:'avalEnfermagem', label:'Avaliação Enfermagem', nomeField:'Nome Paciente'},
+  {key:'avalNutricao', label:'Avaliação Nutrição', nomeField:'Nome Paciente'},
+  {key:'avalRecepcao', label:'Avaliação Recepção', nomeField:'Nome Paciente'},
+  {key:'avalMedico', label:'Avaliação Médico', nomeField:'Nome Paciente'},
+  {key:'avalCS', label:'Avaliação CS', nomeField:'Nome Paciente'},
+  {key:'nps', label:'NPS', nomeField:'Nome Paciente'},
+  {key:'crosssell', label:'Cross-sell', nomeField:'Nome Paciente'},
+  {key:'indicacoes', label:'Indicação', nomeField:'Nome Embaixador'},
+  {key:'agendamentos', label:'Agendamento', nomeField:'Nome do Paciente'},
+];
+function diffParaLog(oldDB, newDB){
+  const entradas = [];
+  LOG_ARRAYS.forEach(({key,label,nomeField})=>{
+    const oldArr = (oldDB && oldDB[key]) || [];
+    const newArr = (newDB && newDB[key]) || [];
+    const oldByRid = {};
+    oldArr.forEach(r=>{ if(r && r._rid) oldByRid[r._rid] = r; });
+    newArr.forEach(novo=>{
+      if(!novo || !novo._rid) return;
+      const antigo = oldByRid[novo._rid];
+      const nome = novo[nomeField] || '';
+      if(!antigo){
+        entradas.push({ array_key:key, registro_id:novo._rid, campo:null, valor_antigo:null, valor_novo:null,
+          descricao:`${label} criado${nome?' — '+nome:''}` });
+        return;
+      }
+      Object.keys(novo).forEach(campo=>{
+        if(campo.startsWith('_')) return;
+        const va = antigo[campo], vn = novo[campo];
+        if(JSON.stringify(va===undefined?null:va) === JSON.stringify(vn===undefined?null:vn)) return;
+        entradas.push({ array_key:key, registro_id:novo._rid, campo,
+          valor_antigo: (va===null||va===undefined)?null:String(va), valor_novo:(vn===null||vn===undefined)?null:String(vn),
+          descricao:`${label}${nome?' — '+nome:''}: "${campo}" alterado` });
+      });
+    });
+  });
+  const oldCfg = (oldDB && oldDB.config) || {};
+  const newCfg = (newDB && newDB.config) || {};
+  Object.keys(newCfg).forEach(k=>{
+    const oldList = JSON.stringify(oldCfg[k]||[]);
+    const newList = JSON.stringify(newCfg[k]||[]);
+    if(oldList !== newList){
+      entradas.push({ array_key:'config', registro_id:k, campo:null, valor_antigo:null, valor_novo:null,
+        descricao:`Lista de configuração "${k}" alterada` });
+    }
+  });
+  return entradas;
+}
+async function registrarAtividade(entradas){
+  if(!sb || !currentUser || !entradas.length) return;
+  const nome = (currentPerfil && currentPerfil.nome) || currentUser.email;
+  const linhas = entradas.slice(0, 200).map(e=> ({ ...e, usuario_id: currentUser.id, usuario_nome: nome }));
+  try{ await sb.from('log_atividade').insert(linhas); }
+  catch(e){ console.warn('Não foi possível gravar o log de atividade:', e); }
 }
 function setSyncStatus(status){
   const el = document.getElementById('sync-status');
@@ -414,6 +486,7 @@ async function iniciarApp(){
   }
   DB = reconcilePatientLinkedSections(ensureShape(DB));
   try{ localStorage.setItem(STORAGE_KEY, JSON.stringify(DB)); }catch(e){}
+  DB_ULTIMO_SYNC = JSON.parse(JSON.stringify(DB));
   renderUserChip();
   document.getElementById('login-loading').style.display = 'none';
   go('dashboard');
@@ -432,6 +505,9 @@ function assinarAtualizacoesEmTempoReal(){
       if(currentUser && novo.atualizado_por === currentUser.id) return;
       DB = reconcilePatientLinkedSections(ensureShape(novo.dados));
       try{ localStorage.setItem(STORAGE_KEY, JSON.stringify(DB)); }catch(e){}
+      // Atualiza a base de comparação do log também — quem já registrou essa mudança foi o outro
+      // usuário, no navegador dele; aqui só alinhamos nossa "foto" pra não duplicar/confundir o log.
+      DB_ULTIMO_SYNC = JSON.parse(JSON.stringify(DB));
       const modalAberto = document.getElementById('modal-bg').classList.contains('show');
       if(!modalAberto){
         renderNav(CURRENT);
@@ -843,6 +919,7 @@ const NAV = [
   {sep:'Administração'},
   {id:'configuracoes', label:'Configurações', ic:'⚙️'},
   {id:'equipe', label:'Equipe', ic:'👥', adminOnly:true},
+  {id:'atividade', label:'Atividade', ic:'🕒', adminOnly:true},
 ];
 
 function renderNav(active){
@@ -893,6 +970,7 @@ const PAGES = {
   avaliacoes:{title:'Avaliações Setoriais', sub:'Enfermagem, Nutrição, Recepção, Médico e CS — cada nota lançada aqui recalcula o Health Score'},
   configuracoes:{title:'Configurações', sub:'Gerencie as listas usadas nos campos editáveis de todos os módulos'},
   equipe:{title:'Equipe', sub:'Quem tem acesso ao sistema — criar login e gerenciar quem está ativo'},
+  atividade:{title:'Atividade', sub:'Registro de quem alterou o quê — atualizado a cada sincronização'},
 };
 
 let CURRENT = 'dashboard';
@@ -3080,13 +3158,44 @@ async function alternarAtivoEquipe(id, ativo){
   const { error } = await sb.from('perfis').update({ ativo }).eq('id', id);
   if(error){ alert('Não foi possível atualizar: ' + error.message); carregarListaEquipe(); }
 }
+function fmtDataHora(iso){
+  if(!iso) return '—';
+  const d = new Date(iso);
+  if(isNaN(d.getTime())) return String(iso);
+  const dd = String(d.getDate()).padStart(2,'0');
+  const mm = String(d.getMonth()+1).padStart(2,'0');
+  const yyyy = d.getFullYear();
+  const hh = String(d.getHours()).padStart(2,'0');
+  const mi = String(d.getMinutes()).padStart(2,'0');
+  return `${dd}/${mm}/${yyyy} ${hh}:${mi}`;
+}
+async function renderAtividade(){
+  document.getElementById('page-actions').innerHTML = '';
+  document.getElementById('content').innerHTML = `
+    <div class="note">Registro automático de alterações feitas por qualquer pessoa da equipe — atualizado a cada sincronização com a nuvem. Mostra as 200 mudanças mais recentes.</div>
+    <div class="toolbar">${toolbarSearch(q=>tbl && tbl.setQuery(q), 'Buscar por pessoa, paciente, campo...')}</div>
+    <div id="tbl-atividade" class="small">Carregando…</div>`;
+  let tbl = null;
+  const { data, error } = await sb.from('log_atividade').select('*').order('quando', {ascending:false}).limit(200);
+  if(error){ document.getElementById('tbl-atividade').textContent = 'Não foi possível carregar o registro: ' + error.message; return; }
+  const cols = [
+    {key:'quando', label:'Quando', render:r=>esc(fmtDataHora(r.quando))},
+    {key:'usuario_nome', label:'Quem', render:r=>esc(r.usuario_nome||'—')},
+    {key:'descricao', label:'O que mudou', render:r=>esc(r.descricao||'—')},
+    {key:'valor_antigo', label:'Antes', render:r=>esc(r.valor_antigo!=null && r.valor_antigo!=='' ? r.valor_antigo : '—')},
+    {key:'valor_novo', label:'Depois', render:r=>esc(r.valor_novo!=null && r.valor_novo!=='' ? r.valor_novo : '—')},
+  ];
+  tbl = renderTable({containerId:'tbl-atividade', columns:cols, rows:data||[],
+    searchKeys:['usuario_nome','descricao','valor_antigo','valor_novo'],
+    emptyMsg:'Nenhuma alteração registrada ainda.'});
+}
 
 const RENDERERS = {
   healthscore: renderHealthScore, dashboard: renderDashboard, pacientes: renderPacientes, agendamentos: renderAgendamentos,
   interacoes: renderInteracoes, protocolos: renderProtocolos, adesao: renderAdesao,
   nps: renderNps, crosssell: renderCrosssell,
   indicacoes: renderIndicacoes, avaliacoes: renderAvaliacoes, configuracoes: renderConfiguracoes,
-  equipe: renderEquipe,
+  equipe: renderEquipe, atividade: renderAtividade,
 };
 
 // init — go('dashboard') agora só roda dentro de iniciarApp(), depois do login (ver bloco SUPABASE acima)
