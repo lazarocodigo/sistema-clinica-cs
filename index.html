@@ -148,9 +148,9 @@ select.status-pill-select.na{background-color:#eef1f1;color:var(--muted);}
 <div id="login-gate">
   <div class="card">
     <h1>Instituto Constancy</h1>
-    <p>Entre com o email e a senha da equipe para acessar o sistema.</p>
-    <label>Email</label>
-    <input type="email" id="lg-email" autocomplete="username">
+    <p>Entre com o email (ou CPF) e a senha da equipe para acessar o sistema.</p>
+    <label>Email ou CPF</label>
+    <input type="text" id="lg-email" autocomplete="username">
     <label>Senha</label>
     <input type="password" id="lg-senha" autocomplete="current-password">
     <button onclick="fazerLogin()">Entrar</button>
@@ -417,6 +417,42 @@ async function iniciarApp(){
   renderUserChip();
   document.getElementById('login-loading').style.display = 'none';
   go('dashboard');
+  assinarAtualizacoesEmTempoReal();
+}
+// Fica escutando mudanças de outros usuários (via Supabase Realtime). Quando alguém mais salva algo,
+// a tela atualiza sozinha — sem precisar dar F5. Ignora o eco da própria gravação (comparando
+// atualizado_por com o usuário logado agora) pra não re-renderizar à toa a cada save nosso.
+let canalRealtime = null;
+function assinarAtualizacoesEmTempoReal(){
+  if(!sb || canalRealtime) return;
+  canalRealtime = sb.channel('dados_app_mudancas')
+    .on('postgres_changes', { event: '*', schema: 'public', table: 'dados_app', filter: 'id=eq.principal' }, (payload)=>{
+      const novo = payload.new;
+      if(!novo || !temDadosReais(novo.dados)) return;
+      if(currentUser && novo.atualizado_por === currentUser.id) return;
+      DB = reconcilePatientLinkedSections(ensureShape(novo.dados));
+      try{ localStorage.setItem(STORAGE_KEY, JSON.stringify(DB)); }catch(e){}
+      const modalAberto = document.getElementById('modal-bg').classList.contains('show');
+      if(!modalAberto){
+        renderNav(CURRENT);
+        if(RENDERERS[CURRENT]) RENDERERS[CURRENT]();
+      }
+      mostrarAvisoAtualizacaoRemota();
+    })
+    .subscribe();
+}
+function mostrarAvisoAtualizacaoRemota(){
+  let toast = document.getElementById('toast-remoto');
+  if(!toast){
+    toast = document.createElement('div');
+    toast.id = 'toast-remoto';
+    toast.style.cssText = 'position:fixed;bottom:20px;right:20px;background:var(--brand-dark);color:#eafaf6;padding:10px 16px;border-radius:8px;font-size:13px;box-shadow:var(--shadow);z-index:10000;opacity:0;transition:opacity .3s;';
+    document.body.appendChild(toast);
+  }
+  toast.textContent = '🔄 Dados atualizados por outro usuário';
+  toast.style.opacity = '1';
+  clearTimeout(toast._timer);
+  toast._timer = setTimeout(()=>{ toast.style.opacity = '0'; }, 2500);
 }
 function renderUserChip(){
   const el = document.getElementById('user-chip');
@@ -425,15 +461,25 @@ function renderUserChip(){
   const papel = (currentPerfil && currentPerfil.papel) || '';
   el.innerHTML = `<div style="font-weight:700;">${esc(nome)}</div><div style="opacity:.8;">${esc(papel)}</div><div id="sync-status" style="margin-top:6px;font-size:11px;color:#9be0d3;">● Sincronizado</div><button onclick="fazerLogout()" style="margin-top:10px;background:transparent;border:1px solid rgba(255,255,255,.3);color:#eafaf6;padding:4px 10px;border-radius:6px;font-size:11px;">Sair</button>`;
 }
+// Login por Email ou por CPF: se o que a pessoa digitou não tem "@", tratamos como CPF e convertemos
+// pro mesmo "email técnico" que usamos ao criar o login (CPF@instituto-constancy.local) — a pessoa
+// nunca precisa saber que por trás disso existe um email, só digita o CPF mesmo.
+function resolverIdentificadorLogin(valor){
+  const v = (valor||'').trim();
+  if(v.includes('@')) return v.toLowerCase();
+  const digits = v.replace(/\D/g, '');
+  return digits ? `${digits}@instituto-constancy.local` : v;
+}
 async function fazerLogin(){
-  const email = document.getElementById('lg-email').value.trim();
+  const digitado = document.getElementById('lg-email').value.trim();
   const senha = document.getElementById('lg-senha').value;
   const erroEl = document.getElementById('lg-erro');
   erroEl.style.display = 'none';
-  if(!email || !senha){ erroEl.textContent = 'Preencha email e senha.'; erroEl.style.display='block'; return; }
+  if(!digitado || !senha){ erroEl.textContent = 'Preencha email/CPF e senha.'; erroEl.style.display='block'; return; }
+  const email = resolverIdentificadorLogin(digitado);
   try{
     const { data, error } = await sb.auth.signInWithPassword({ email, password: senha });
-    if(error){ erroEl.textContent = 'Email ou senha incorretos.'; erroEl.style.display='block'; return; }
+    if(error){ erroEl.textContent = 'Email/CPF ou senha incorretos.'; erroEl.style.display='block'; return; }
     await onLoginSucesso(data.session);
   }catch(e){
     erroEl.textContent = 'Erro ao entrar: ' + (e && e.message ? e.message : String(e));
@@ -796,10 +842,12 @@ const NAV = [
   {id:'avaliacoes', label:'Avaliações', ic:'📝'},
   {sep:'Administração'},
   {id:'configuracoes', label:'Configurações', ic:'⚙️'},
+  {id:'equipe', label:'Equipe', ic:'👥', adminOnly:true},
 ];
 
 function renderNav(active){
-  document.getElementById('nav').innerHTML = NAV.map((n)=>{
+  const souAdmin = !!(currentPerfil && currentPerfil.admin);
+  document.getElementById('nav').innerHTML = NAV.filter(n=> !n.adminOnly || souAdmin).map((n)=>{
     if(n.sep) return `<div class="nav-sep">${esc(n.sep)}</div>`;
     // Subitens de setor (Médico/Enfermagem/Nutricional/CS, abaixo de Interações) ficam ativos só quando
     // a página é Interações E o setor selecionado bate com o desse item — assim o menu sempre mostra
@@ -844,6 +892,7 @@ const PAGES = {
   indicacoes:{title:'Indicações', sub:'Programa de Embaixadores — leads, conversões e recompensas'},
   avaliacoes:{title:'Avaliações Setoriais', sub:'Enfermagem, Nutrição, Recepção, Médico e CS — cada nota lançada aqui recalcula o Health Score'},
   configuracoes:{title:'Configurações', sub:'Gerencie as listas usadas nos campos editáveis de todos os módulos'},
+  equipe:{title:'Equipe', sub:'Quem tem acesso ao sistema — criar login e gerenciar quem está ativo'},
 };
 
 let CURRENT = 'dashboard';
@@ -2945,11 +2994,99 @@ function addConfigItem(configKey){
   renderConfiguracoes();
 }
 
+// ================= EQUIPE (só Admin vê) =================
+// Cria login pra gente nova direto pelo sistema, sem precisar entrar no Supabase. A senha é definida
+// na hora aqui mesmo (combinado: mais ágil pro momento inicial) — o Admin compartilha essa senha com
+// a pessoa por fora (WhatsApp etc.). O login pode ser por Email OU por CPF (útil pra quem não usa
+// muito email no dia a dia) — o sistema entende os dois na tela de entrada.
+async function renderEquipe(){
+  document.getElementById('page-actions').innerHTML = '';
+  document.getElementById('content').innerHTML = `
+    <div class="note">Aqui você cria o login de quem vai usar o sistema, e pode desativar acesso de alguém que saiu. Todo mundo que tiver login vê e edita os mesmos dados (não tem restrição por setor ainda).</div>
+    <div class="card" style="margin-bottom:16px;">
+      <h3>+ Nova pessoa da equipe</h3>
+      <div class="form-grid" id="new-equipe-form">
+        <label>Nome completo <input type="text" name="nome" placeholder="Nome da pessoa"></label>
+        <label>Papel / Setor <input type="text" name="papel" placeholder="Ex: Enfermagem, Nutrição, CS..."></label>
+        <label>Email <input type="email" name="email" placeholder="opcional se preencher CPF"></label>
+        <label>CPF <input type="text" name="cpf" placeholder="opcional se preencher Email"></label>
+        <label>Senha provisória <input type="text" name="senha" placeholder="mínimo 6 caracteres"></label>
+        <label style="display:flex;align-items:center;gap:8px;flex-direction:row;"><input type="checkbox" name="admin" style="width:auto;"> Também é Admin (pode criar outros logins)</label>
+        <label class="full"><button class="btn" onclick="criarUsuarioEquipe()">Criar login</button> <span id="equipe-msg" class="small" style="margin-left:10px;"></span></label>
+      </div>
+    </div>
+    <div class="card">
+      <h3>Quem já tem acesso</h3>
+      <div id="lista-equipe" class="small">Carregando…</div>
+    </div>
+  `;
+  await carregarListaEquipe();
+}
+// Atualiza só a lista de pessoas (não redesenha a tela toda) — assim uma mensagem de sucesso/erro
+// no formulário de cima não some antes da pessoa conseguir ler.
+async function carregarListaEquipe(){
+  const box = document.getElementById('lista-equipe');
+  if(!box) return;
+  const { data, error } = await sb.from('perfis').select('*').order('nome');
+  if(error){ box.textContent = 'Não foi possível carregar a lista: ' + error.message; return; }
+  if(!data || !data.length){ box.textContent = 'Ninguém cadastrado ainda.'; return; }
+  box.innerHTML = data.map(p=>`
+    <div style="display:flex;align-items:center;justify-content:space-between;padding:8px 0;border-bottom:1px solid var(--line);">
+      <div>
+        <div style="font-weight:700;color:var(--ink);">${esc(p.nome||'—')} ${p.admin?'<span class="pill ativo">Admin</span>':''}</div>
+        <div>${esc(p.papel||'—')}${p.cpf?' · CPF '+esc(p.cpf):''}</div>
+      </div>
+      <label style="display:flex;align-items:center;gap:6px;flex-direction:row;">
+        <input type="checkbox" style="width:auto;" ${p.ativo?'checked':''} onchange="alternarAtivoEquipe('${esc(p.id)}', this.checked)"> Ativo
+      </label>
+    </div>
+  `).join('');
+}
+async function criarUsuarioEquipe(){
+  const form = document.getElementById('new-equipe-form');
+  const msg = document.getElementById('equipe-msg');
+  const val = name => (form.querySelector(`[name="${name}"]`)||{}).value || '';
+  const nome = val('nome').trim();
+  const papel = val('papel').trim();
+  const email = val('email').trim();
+  const cpf = val('cpf').trim();
+  const senha = val('senha');
+  const admin = form.querySelector('[name="admin"]').checked;
+  msg.style.color = 'var(--muted)';
+  msg.textContent = 'Criando…';
+  try{
+    const { data, error } = await sb.functions.invoke('criar-usuario', { body: { nome, papel, email, cpf, senha } });
+    if(error || (data && data.error)){
+      msg.style.color = 'var(--danger)';
+      msg.textContent = (data && data.error) ? data.error : (error ? error.message : 'Erro ao criar usuário.');
+      return;
+    }
+    if(admin && data && data.ok && data.id){
+      // Quem está criando já é Admin (só admin chama essa função), então pode marcar o novo
+      // usuário como Admin também — a política de RLS de perfis permite admin editar qualquer perfil.
+      await sb.from('perfis').update({ admin: true }).eq('id', data.id);
+    }
+    msg.style.color = 'var(--ok)';
+    msg.textContent = `Login criado! ${data.usaCpf ? 'Acesso por CPF' : 'Acesso por email: ' + data.login}`;
+    form.querySelectorAll('input[type="text"], input[type="email"]').forEach(el=> el.value = '');
+    form.querySelector('[name="admin"]').checked = false;
+    carregarListaEquipe();
+  }catch(e){
+    msg.style.color = 'var(--danger)';
+    msg.textContent = 'Erro inesperado: ' + (e && e.message ? e.message : String(e));
+  }
+}
+async function alternarAtivoEquipe(id, ativo){
+  const { error } = await sb.from('perfis').update({ ativo }).eq('id', id);
+  if(error){ alert('Não foi possível atualizar: ' + error.message); carregarListaEquipe(); }
+}
+
 const RENDERERS = {
   healthscore: renderHealthScore, dashboard: renderDashboard, pacientes: renderPacientes, agendamentos: renderAgendamentos,
   interacoes: renderInteracoes, protocolos: renderProtocolos, adesao: renderAdesao,
   nps: renderNps, crosssell: renderCrosssell,
   indicacoes: renderIndicacoes, avaliacoes: renderAvaliacoes, configuracoes: renderConfiguracoes,
+  equipe: renderEquipe,
 };
 
 // init — go('dashboard') agora só roda dentro de iniciarApp(), depois do login (ver bloco SUPABASE acima)
