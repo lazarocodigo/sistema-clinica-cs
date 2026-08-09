@@ -3136,7 +3136,14 @@ async function criarUsuarioEquipe(){
     const { data, error } = await sb.functions.invoke('criar-usuario', { body: { nome, papel, email, cpf, senha } });
     if(error || (data && data.error)){
       msg.style.color = 'var(--danger)';
-      msg.textContent = (data && data.error) ? data.error : (error ? error.message : 'Erro ao criar usuário.');
+      let corpo = data;
+      // Em algumas versões do supabase-js, quando a função responde com status de erro (4xx/5xx),
+      // o `data` vem vazio e o corpo de verdade (com a mensagem específica) fica só dentro de
+      // `error.context` (a Response bruta) — sem isso a pessoa só veria um texto genérico.
+      if((!corpo || !corpo.error) && error && error.context && typeof error.context.json === 'function'){
+        try{ corpo = await error.context.json(); }catch(e){}
+      }
+      msg.textContent = (corpo && corpo.error) ? corpo.error : (error ? error.message : 'Erro ao criar usuário.');
       return;
     }
     if(admin && data && data.ok && data.id){
