@@ -3143,8 +3143,7 @@ async function criarUsuarioEquipe(){
       if((!corpo || !corpo.error) && error && error.context && typeof error.context.json === 'function'){
         try{ corpo = await error.context.json(); }catch(e){}
       }
-      const mensagemBase = (corpo && corpo.error) ? corpo.error : (error ? error.message : 'Erro ao criar usuário.');
-      msg.textContent = mensagemBase + (corpo && corpo.debug ? ' [debug: ' + JSON.stringify(corpo.debug) + ']' : '');
+      msg.textContent = (corpo && corpo.error) ? corpo.error : (error ? error.message : 'Erro ao criar usuário.');
       return;
     }
     if(admin && data && data.ok && data.id){
